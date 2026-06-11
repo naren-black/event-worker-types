@@ -1,0 +1,11 @@
+# Runtime dependencies for the transfer worker.
+# Pin exact versions for reproducible builds; bump deliberately and re-run
+# `pip-audit` (see .github/workflows/ci.yml).
+
+pika==1.3.2
+boto3==1.34.69
+google-cloud-storage==2.14.0
+google-auth==2.28.2
+watchdog==4.0.0
+pydantic==2.6.4
+prometheus-client==0.20.0

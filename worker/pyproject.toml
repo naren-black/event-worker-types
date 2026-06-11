@@ -1,0 +1,26 @@
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["src"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "S"]
+ignore = [
+    "S101",  # assert is fine in tests and defensive checks
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101", "S105", "S106"]
+
+[tool.bandit]
+exclude_dirs = ["tests", ".venv"]
+# B104 (bind 0.0.0.0): expected for a containerised health endpoint exposed via Docker port mapping.
+# B101 (assert): used only as an internal invariant check (regex match guaranteed by an
+# earlier validator), matching the ruff S101 ignore above - never on untrusted input.
+skips = ["B104", "B101"]

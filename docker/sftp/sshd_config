@@ -1,0 +1,10 @@
+# Drop-in overrides for atmoz/sftp's sshd_config (loaded from
+# /etc/ssh/sshd_config.d/, which the base image's sshd_config already
+# includes).
+
+# Verbose logging so file uploads are visible via `docker compose logs sftp`
+# - useful when demoing the watcher reacting to a new file.
+LogLevel VERBOSE
+
+# Modest brute-force friction for the demo-only password account.
+MaxAuthTries 3

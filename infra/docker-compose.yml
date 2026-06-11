@@ -1,0 +1,248 @@
+services:
+
+  # ────────────────────────────────────────────────
+  # SFTP server (atmoz/sftp)
+  # Drop a CSV into the sftp-data volume to trigger
+  # the worker via inotify on the shared volume.
+  # Connect: sftp -P 2222 sftpuser@localhost
+  # ────────────────────────────────────────────────
+  sftp:
+    build:
+      context: ../docker/sftp
+      dockerfile: Dockerfile
+    container_name: sftp
+    ports:
+      - "2222:22"
+    volumes:
+      - sftp-data:/home/sftpuser/upload
+    environment:
+      # Demo-only credentials for the local SFTP emulator (not a real secret).
+      SFTP_USERS: sftpuser:${SFTP_PASSWORD:-demopass}:1001:1001:upload
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "22"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - internal
+
+  # ────────────────────────────────────────────────
+  # RabbitMQ message broker
+  # Management UI : http://localhost:15672
+  # Credentials   : guest / guest (dev only)
+  # Queue topology (main/retry/DLQ) is declared at
+  # startup by the worker - see src/publisher.py
+  # (declare_topology), so it's visible in the
+  # management UI once the worker is up.
+  # ────────────────────────────────────────────────
+  rabbitmq:
+    build:
+      context: ../docker/rabbitmq
+      dockerfile: Dockerfile
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"    # AMQP
+      - "15672:15672"  # Management UI
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS:-guest}
+      RABBITMQ_DEFAULT_VHOST: ${RABBITMQ_VHOST:-/}
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - internal
+
+  # ────────────────────────────────────────────────
+  # MinIO — local S3 emulator (AWS path)
+  # API  : http://localhost:9000
+  # UI   : http://localhost:9001
+  # Credentials set via .env (MINIO_ROOT_USER/PASS)
+  # ────────────────────────────────────────────────
+  minio:
+    image: quay.io/minio/minio:latest
+    container_name: minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web console
+    volumes:
+      - minio-data:/data
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - internal
+
+  # ────────────────────────────────────────────────
+  # MinIO bucket init (runs once then exits)
+  # Creates the target bucket and sets it to private.
+  # ────────────────────────────────────────────────
+  minio-init:
+    image: quay.io/minio/mc:latest
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin} &&
+        mc mb --ignore-existing local/${S3_BUCKET:-wms-orders-processed} &&
+        mc anonymous set none local/${S3_BUCKET:-wms-orders-processed} &&
+        echo 'MinIO bucket ready.'
+      "
+    networks:
+      - internal
+
+  # ────────────────────────────────────────────────
+  # fake-gcs-server — local GCS emulator (GCP path)
+  # API: http://localhost:4443
+  # No auth required in local mode.
+  # ────────────────────────────────────────────────
+  fake-gcs:
+    build:
+      context: ../docker/fake-gcs
+      dockerfile: Dockerfile
+    container_name: fake-gcs
+    ports:
+      - "4443:4443"
+    volumes:
+      - gcs-data:/data
+    command: [
+      "-scheme", "http",
+      "-port", "4443",
+      "-backend", "filesystem",
+      "-filesystem-root", "/data",
+      "-public-host", "fake-gcs:4443"
+    ]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:4443/storage/v1/b"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - internal
+
+  # ────────────────────────────────────────────────
+  # fake-gcs bucket init (runs once then exits)
+  # fake-gcs-server doesn't auto-create buckets, so
+  # create the target bucket via its JSON API.
+  # ────────────────────────────────────────────────
+  fake-gcs-init:
+    image: curlimages/curl:8.8.0
+    container_name: fake-gcs-init
+    depends_on:
+      fake-gcs:
+        condition: service_healthy
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >-
+        curl -sf -X POST http://fake-gcs:4443/storage/v1/b
+        -H "Content-Type: application/json"
+        -d "{\"name\": \"${GCS_BUCKET:-wms-orders-processed}\"}"
+        || true; echo "fake-gcs bucket ready."
+    networks:
+      - internal
+
+  # ────────────────────────────────────────────────
+  # Python event worker
+  # Watches sftp-data volume via inotify,
+  # publishes to RabbitMQ, consumes events,
+  # then uploads concurrently to S3 + GCS.
+  # Health: http://localhost:8080/health
+  # ────────────────────────────────────────────────
+  worker:
+    build:
+      context: ..
+      dockerfile: docker/worker/Dockerfile
+    container_name: worker
+    ports:
+      - "8080:8080"
+    volumes:
+      - sftp-data:/watch:ro
+      - worker-data:/data
+    environment:
+      # Watcher
+      WATCH_DIR: /watch
+
+      # Broker
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_PASS: ${RABBITMQ_PASS:-guest}
+      RABBITMQ_VHOST: ${RABBITMQ_VHOST:-/}
+      QUEUE_NAME: ${QUEUE_NAME:-orders.inbound}
+      DLQ_NAME: ${DLQ_NAME:-orders.inbound.dlq}
+
+      # AWS / S3 (MinIO in dev)
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_BUCKET: ${S3_BUCKET:-wms-orders-processed}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+
+      # GCP / GCS (fake-gcs in dev)
+      GCS_ENDPOINT_URL: http://fake-gcs:4443
+      GCS_BUCKET: ${GCS_BUCKET:-wms-orders-processed}
+      GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-demo-project}
+
+      # Worker behaviour
+      UPLOAD_MAX_CONCURRENCY: ${UPLOAD_MAX_CONCURRENCY:-2}
+      RETRY_MAX_ATTEMPTS: ${RETRY_MAX_ATTEMPTS:-3}
+      RETRY_BACKOFF_BASE: ${RETRY_BACKOFF_BASE:-2}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      CORRELATION_SECRET: ${CORRELATION_SECRET:-dev-secret-change-me}
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      fake-gcs:
+        condition: service_healthy
+      sftp:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      fake-gcs-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: on-failure
+    networks:
+      - internal
+
+# ────────────────────────────────────────────────
+# Named volumes
+# sftp-data: shared between sftp (rw) and worker (ro)
+# worker-data: persists the worker's SQLite idempotency
+# DB across `docker compose restart worker`.
+# ────────────────────────────────────────────────
+volumes:
+  sftp-data:
+  rabbitmq-data:
+  minio-data:
+  gcs-data:
+  worker-data:
+
+# ────────────────────────────────────────────────
+# Single internal bridge network.
+# Services reference each other by container name.
+# Only explicitly mapped ports reach the host.
+# ────────────────────────────────────────────────
+networks:
+  internal:
+    driver: bridge

@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/example/sftp-event-worker/schemas/transfer-event.schema.json",
+  "title": "CrossCloudTransferRequested",
+  "description": "Emitted by the SFTP watcher when a complete file is detected on the watch path. Consumed by the transfer worker, which copies the file to one or more cloud storage destinations.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "eventType",
+    "eventId",
+    "correlationId",
+    "idempotencyKey",
+    "occurredAt",
+    "source",
+    "file",
+    "destinations"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+$",
+      "description": "MAJOR.MINOR. MINOR bumps add optional fields only (non-breaking). MAJOR bumps may remove/rename/retype fields. Consumers MUST route events with an unsupported MAJOR to the DLQ with reason 'unsupported_schema_version'.",
+      "examples": ["1.0"]
+    },
+    "eventType": {
+      "type": "string",
+      "enum": ["file.transfer.requested"],
+      "description": "Discriminator for future event types on the same exchange/topic."
+    },
+    "eventId": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Unique ID for this specific publish attempt. Changes on republish; NOT used for de-duplication."
+    },
+    "correlationId": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Stable across the lifetime of a single file's journey (watcher -> queue -> consumer -> both uploads). Propagated into logs and DLQ messages for tracing."
+    },
+    "idempotencyKey": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$",
+      "description": "Deterministic key derived from source path + file size + content checksum. Stable across redeliveries/retries of the SAME file, so the consumer can safely no-op on duplicates."
+    },
+    "occurredAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "UTC timestamp (RFC 3339) when the watcher observed the file as stable/complete."
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "path"],
+      "properties": {
+        "provider": {
+          "type": "string",
+          "enum": ["sftp"]
+        },
+        "path": {
+          "type": "string",
+          "description": "Absolute path of the file inside the watcher's mounted volume."
+        }
+      }
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "sizeBytes", "checksumSha256"],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "sizeBytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "checksumSha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$",
+          "description": "SHA-256 of the file content at detection time. Used for idempotency key derivation and post-upload integrity verification."
+        },
+        "contentType": {
+          "type": "string",
+          "description": "Best-effort MIME type, e.g. text/csv.",
+          "examples": ["text/csv"]
+        }
+      }
+    },
+    "destinations": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["provider", "bucket", "key"],
+        "properties": {
+          "provider": {
+            "type": "string",
+            "enum": ["aws-s3", "gcp-gcs"]
+          },
+          "bucket": {
+            "type": "string"
+          },
+          "key": {
+            "type": "string",
+            "description": "Object key/path within the destination bucket."
+          },
+          "region": {
+            "type": "string",
+            "description": "Optional, AWS only."
+          }
+        }
+      },
+      "description": "One entry per cloud target. The consumer fans these out CONCURRENTLY and the event is only fully processed once every destination has ack'd."
+    },
+    "retry": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Populated by the consumer (not the watcher) when a message is republished after a transient failure. Absent on first publish.",
+      "properties": {
+        "attempt": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "1-based attempt number for this message."
+        },
+        "maxAttempts": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "lastError": {
+          "type": "string",
+          "description": "Short machine-readable error code from the previous attempt, e.g. 'gcp-gcs:upload_timeout'."
+        }
+      }
+    }
+  }
+}
