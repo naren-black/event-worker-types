@@ -28,6 +28,16 @@ flowchart LR
         GCS[("fake-gcs / GCS\nwms-orders-processed")]
     end
 
+    subgraph ingestion["Serverless CSV ingestion (ADR 0002)"]
+        direction TB
+        L["Lambda\norder-csv-to-dynamodb"]
+        CF["Cloud Function (2nd gen)\norder-csv-to-firestore"]
+        DDB[("DynamoDB\norder-line-items")]
+        FS[("Firestore (Native)\norders/{orderId}/lineItems/{sku}")]
+        L --> DDB
+        CF --> FS
+    end
+
     F -- "IN_CLOSE_WRITE / moved" --> W
     W -- "publish file.transfer.requested" --> Q
     Q --> C
@@ -36,6 +46,8 @@ flowchart LR
     C -- "transient failure\n(publish with TTL)" --> R
     R -- "TTL expiry\n(dead-letter)" --> Q
     C -- "permanent failure /\nmax retries exceeded" --> D
+    S3 -- "s3:ObjectCreated\norders/*.csv" --> L
+    GCS -- "object.v1.finalized (Eventarc)\norders/*.csv" --> CF
 ```
 
 ## Components
@@ -116,6 +128,31 @@ A dependency-free `ThreadingHTTPServer` on the main thread, serving:
   `upload_duration_seconds{provider}`, `uploads_total{provider,result}`,
   `dlq_messages_total`, `idempotency_hits_total`.
 
+### Serverless CSV ingestion (`infra/terraform/aws_lambda.tf`, `gcp_function.tf`)
+Downstream of the worker's uploads, each cloud has one small function that
+turns the `orders/*.csv` objects into queryable NoSQL rows - see ADR 0002 for
+the full evaluation and trade-offs:
+
+- **AWS**: `aws_s3_bucket_notification` fires `order-csv-to-dynamodb` (Lambda,
+  Python 3.12,
+  [`functions/aws_order_csv_to_dynamodb/handler.py`](../infra/terraform/functions/aws_order_csv_to_dynamodb/handler.py))
+  directly on `s3:ObjectCreated:*` for `orders/*.csv`. It streams the object,
+  parses it with `csv.DictReader`, and `batch_writer().put_item()`s one item
+  per row into the `order-line-items` DynamoDB table (partition key
+  `orderId`, sort key `sku`, `PAY_PER_REQUEST` billing). Failed async
+  invocations land in an SQS dead-letter queue.
+- **GCP**: `order-csv-to-firestore` (Cloud Functions 2nd gen, Python 3.12,
+  [`functions/gcp_order_csv_to_firestore/main.py`](../infra/terraform/functions/gcp_order_csv_to_firestore/main.py))
+  has a built-in Eventarc trigger on
+  `google.cloud.storage.object.v1.finalized` for the same bucket, filtered
+  in-code to `orders/*.csv`. It downloads the object, parses it the same way,
+  and `set()`s one document per row at `orders/{orderId}/lineItems/{sku}` in a
+  Firestore (Native mode) database.
+- **Idempotent by overwrite**: both functions key writes on the CSV's own
+  `order_id`/`sku` columns, so a redelivered notification overwrites the same
+  item/document rather than duplicating it - no separate dedupe table, the
+  same pattern Benthos uses (`collision_mode: overwrite`, `guide/13-benthos.md`).
+
 ## Data-flow walkthroughs
 
 **Happy path**: file lands → watcher detects `IN_CLOSE_WRITE` → publishes to
@@ -137,6 +174,14 @@ in all cases the consumer publishes to `orders.inbound.dlq` (with
 `x-dlq-reason` / `retry.lastError` context) and acks the original message, so
 it's never silently dropped or stuck retrying forever.
 `dlq_messages_total` increments.
+
+**Serverless ingestion path**: once the worker's S3 upload completes, the
+bucket notification invokes `order-csv-to-dynamodb`, which writes one
+DynamoDB item per CSV row; in parallel, once the GCS upload completes,
+Eventarc invokes `order-csv-to-firestore`, which writes one Firestore document
+per row. Both run independently of the RabbitMQ pipeline and of each other -
+a failure in one cloud's function doesn't block the other's, and a
+redelivered trigger just overwrites the same rows/documents.
 
 ## Design rationale
 
@@ -163,3 +208,9 @@ it's never silently dropped or stuck retrying forever.
 - **Stdlib-only health/metrics server.** No Flask/FastAPI dependency keeps the
   runtime image smaller and reduces the surface `pip-audit`/`bandit` need to
   cover, for three small endpoints.
+- **One directly-triggered function per cloud for CSV ingestion, not a shared
+  orchestrator.** DynamoDB and Firestore are both fully serverless and
+  pay-per-request, and S3/GCS notifications can invoke a function directly -
+  so no queue, state machine, or always-on service is needed between "file
+  lands" and "rows are queryable". See `ADR.md` (ADR 0002) for the full
+  per-service evaluation and the DLQ asymmetry this introduces.

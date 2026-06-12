@@ -17,9 +17,23 @@ It illustrates, alongside
   service account granted `roles/storage.objectAdmin` on that bucket only,
   bound to a Workload Identity Federation pool so the worker never needs a
   downloadable JSON key.
+- **`aws_lambda.tf`** - a Lambda function (`order-csv-to-dynamodb`, Python
+  3.12) triggered by S3 `ObjectCreated` notifications on `orders/*.csv` in the
+  bucket from `aws.tf`, plus the DynamoDB table it writes to
+  (`order-line-items`, on-demand billing, keyed on `orderId`/`sku`) and an SQS
+  dead-letter queue for failed invocations. Its source lives in
+  [`functions/aws_order_csv_to_dynamodb/`](functions/aws_order_csv_to_dynamodb/).
+- **`gcp_function.tf`** - a Cloud Function (2nd gen) `order-csv-to-firestore`
+  (Python 3.12) triggered via Eventarc on object-finalize events for the
+  bucket from `gcp.tf`, writing to a Firestore (Native mode) database at
+  `orders/{orderId}/lineItems/{sku}`. Its source lives in
+  [`functions/gcp_order_csv_to_firestore/`](functions/gcp_order_csv_to_firestore/).
+  See [ADR 0002](../../ADR.md) for the design rationale, alternatives
+  considered, and a known gap (no GCP-side DLQ equivalent).
 - **`variables.tf`** / **`outputs.tf`** - the minimal inputs (bucket name,
-  account/project IDs, OIDC/WIF identifiers) and outputs (role ARN, service
-  account email, bucket names) needed to wire a real deployment to these
+  account/project IDs, OIDC/WIF identifiers, table name) and outputs (role
+  ARN, service account email, bucket names, function names, table name, DLQ
+  URL, Firestore database name) needed to wire a real deployment to these
   resources.
 
 In a real deployment, `S3_ENDPOINT_URL` / `GCS_ENDPOINT_URL` (see

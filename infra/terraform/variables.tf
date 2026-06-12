@@ -42,8 +42,20 @@ variable "gcp_project_id" {
   default     = "demo-project"
 }
 
+variable "gcp_region" {
+  description = "GCP region for the Cloud Function, its source bucket, and the Firestore database."
+  type        = string
+  default     = "us-central1"
+}
+
 variable "gcp_workload_identity_pool" {
   description = "Full resource name of the Workload Identity Federation pool the worker authenticates through."
   type        = string
   default     = "projects/123456789/locations/global/workloadIdentityPools/sftp-event-worker"
+}
+
+variable "order_line_items_table_name" {
+  description = "Name of the DynamoDB table that order-csv-to-dynamodb writes parsed CSV rows into."
+  type        = string
+  default     = "order-line-items"
 }

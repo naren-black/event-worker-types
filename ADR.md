@@ -81,3 +81,114 @@ the actual work. Specific choices:
   Federation, least-privilege per bucket) is documented in
   `docs/event-contract.md` and sketched (illustratively, non-deployable) in
   `infra/terraform/`.
+
+---
+
+# ADR 0002: Serverless CSV-to-NoSQL ingestion per cloud
+
+**Status:** Accepted
+
+## Context
+
+Once the worker lands an `orders/*.csv` file in S3 and an equivalent object in
+GCS (ADR 0001), nothing reads those files back out - they just sit in object
+storage. A natural next step for a WMS demo is to parse each CSV's order lines
+and make them queryable, in each cloud, without standing up a database server.
+The brief asks for: a Lambda/Cloud Run-or-Functions handler per cloud, a
+"simple NoSQL db" per cloud, and Terraform for the lot, evaluating the
+relevant AWS/GCP services first.
+
+The CSV format (per `scripts/drop-test-file.sh`) is a header row
+`order_id,sku,quantity,channel` followed by one line per order item - i.e. a
+denormalized order-line-item export, not a single-row-per-order summary.
+
+## Decision
+
+**One small, directly-triggered function per cloud, writing to that cloud's
+serverless document/NoSQL store, keyed on `(orderId, sku)`:**
+
+- **AWS**: `aws_s3_bucket_notification` on the existing `orders_processed`
+  bucket fires `order-csv-to-dynamodb` (Lambda, Python 3.12,
+  `s3:ObjectCreated:*` on `orders/*.csv`) directly - no intermediate queue.
+  The function streams the object from S3, parses it with `csv.DictReader`,
+  and `batch_writer().put_item()`s one row per line item into a
+  **DynamoDB** table (`order-line-items`, `PAY_PER_REQUEST`, partition key
+  `orderId`, sort key `sku`). Failed async invocations go to an SQS DLQ via
+  `dead_letter_config`.
+- **GCP**: a **Cloud Functions (2nd gen)** function `order-csv-to-firestore`
+  (Python 3.12) is deployed with a built-in Eventarc trigger on
+  `google.cloud.storage.object.v1.finalized` for the `orders_processed`
+  bucket, filtered in-code to `orders/*.csv`. It downloads the object, parses
+  it the same way, and `set()`s one **Firestore** (Native mode) document per
+  row at `orders/{orderId}/lineItems/{sku}`.
+- **Idempotency by overwrite, not dedupe.** Both functions key writes on the
+  CSV's own `(order_id, sku)` columns, so a redelivered S3/GCS notification
+  (or a re-uploaded file with the same rows) simply overwrites the same
+  item/document with the same data - no separate dedupe table, mirroring the
+  `collision_mode: overwrite` precedent from the Benthos stream pipeline
+  (`guide/13-benthos.md`).
+
+## Alternatives considered & rejected
+
+- **AWS: EventBridge → Step Functions / Glue / EMR Serverless.** All three are
+  built for orchestrating multi-stage or large-scale (Spark-size) data
+  pipelines. A single small CSV per file is a one-function job; adding a
+  state machine, a Glue catalog, or a Spark cluster would be infrastructure
+  the demo never exercises.
+- **AWS: SNS/SQS fan-out in front of the Lambda.** Useful when multiple
+  consumers need the same S3 event, but there is exactly one consumer here.
+  `aws_s3_bucket_notification`'s native `lambda_function` block is simpler and
+  one resource fewer.
+- **AWS: DynamoDB vs. Aurora Serverless v2 / RDS / Timestream.** Aurora/RDS
+  need a VPC, subnet group, and a always-billed (or scale-to-zero-with-cold-
+  starts) instance - heavy for "insert parsed rows". Timestream is
+  purpose-built for time-series metrics, not order line items. DynamoDB's
+  on-demand mode bills per request with zero idle cost and needs no network
+  plumbing, matching "simple NoSQL db".
+- **GCP: Cloud Run vs. Cloud Functions (2nd gen).** 2nd-gen Cloud Functions
+  *are* Cloud Run under the hood, but `google_cloudfunctions2_function`'s
+  `event_trigger` block wires the Eventarc GCS trigger (and its Pub/Sub
+  plumbing) for you. A hand-rolled Cloud Run service would need a separate
+  `google_eventarc_trigger` resource pointed at it - more resources for the
+  same outcome, so Cloud Functions 2nd gen was chosen for this demo.
+- **GCP: Dataflow.** Apache Beam/Dataflow is for large, possibly-streaming,
+  possibly-multi-source transforms with autoscaling workers - far beyond
+  parsing one small CSV per upload.
+- **GCP: Firestore vs. Bigtable / Cloud SQL.** Bigtable's minimum cluster
+  pricing (and its wide-column model) is overkill for a handful of order
+  documents. Cloud SQL needs a provisioned instance and VPC connector for a
+  serverless function to reach it. Firestore Native mode is fully serverless,
+  bills per operation, and its document/subcollection model
+  (`orders/{orderId}/lineItems/{sku}`) maps naturally onto an order with many
+  line items.
+
+## Consequences / trade-offs
+
+- **DLQ asymmetry between clouds.** `aws_lambda_function.dead_letter_config`
+  is one extra resource (an SQS queue). The Cloud Functions 2nd gen
+  `event_trigger` has no equivalent `dead_letter_config` - a real DLQ would
+  require hand-wiring a `google_eventarc_trigger` with a Pub/Sub topic and
+  `dead_letter_policy`, plus granting Pub/Sub's service agent
+  `roles/pubsub.publisher` on that topic. This is called out as a known gap
+  rather than implemented, to keep the GCP side at the same scope as the AWS
+  side.
+- **Schema coupling.** The CSV's column names (`order_id`, `sku`, `quantity`,
+  `channel`) flow directly into both the DynamoDB item's and the Firestore
+  document's field names. Changing the CSV format produced by
+  `worker/src/uploader.py` (or `scripts/drop-test-file.sh`) requires a
+  coordinated change to both `functions/aws_order_csv_to_dynamodb/handler.py`
+  and `functions/gcp_order_csv_to_firestore/main.py` - there is no schema
+  registry between them.
+- **Eventarc/Pub/Sub IAM plumbing is GCP-only ceremony.** The
+  `google_project_iam_member.gcs_pubsub_publisher` grant
+  (`roles/pubsub.publisher` for the GCS service agent) exists purely so
+  Eventarc's GCS trigger can receive finalize notifications - there is no AWS
+  equivalent, since `aws_s3_bucket_notification` talks to Lambda directly.
+- **Both functions are least-privilege and pay-per-use**: read-only on the
+  source bucket prefix, write-only on their own table/collection, and (on
+  AWS) send-only to their own DLQ - with no provisioned capacity sitting idle
+  between file drops.
+- **Still illustrative, not deployable as-is.** `aws_lambda.tf` and
+  `gcp_function.tf` follow ADR 0001's existing stub conventions (no
+  `required_providers`/`provider`/backend blocks) - see
+  `infra/terraform/README.md`.
