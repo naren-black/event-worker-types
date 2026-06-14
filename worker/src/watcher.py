@@ -14,16 +14,20 @@ actual publishing.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import queue
 import threading
 
+import pika
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
 from . import metrics
+from . import publisher as publisher_mod
 from .config import Settings
+from .health import ReadinessState
 from .publisher import Publisher
 from .schema import Destination, FileMeta, Source, TransferEvent
 from .utils import compute_idempotency_key, new_uuid, sha256_file, utcnow_iso
@@ -102,12 +106,64 @@ class DetectedFileHandler(FileSystemEventHandler):
         self._queue.put(event.dest_path)
 
 
-def run_watcher(settings: Settings, publisher: Publisher, stop_event: threading.Event) -> None:
+def _reconnect(
+    connection: pika.BlockingConnection, settings: Settings
+) -> tuple[pika.BlockingConnection, Publisher]:
+    """Close a (presumed dead) connection and open a fresh one with topology re-declared."""
+    with contextlib.suppress(Exception):
+        connection.close()
+    connection, _channel, publisher = publisher_mod.connect_and_setup(settings)
+    return connection, publisher
+
+
+def _publish_with_reconnect(
+    connection: pika.BlockingConnection,
+    publisher: Publisher,
+    event: TransferEvent,
+    settings: Settings,
+) -> tuple[pika.BlockingConnection, Publisher]:
+    """Publish ``event``, transparently reconnecting once if the connection/channel is dead."""
+    try:
+        publisher.publish_event(event)
+        metrics.EVENTS_PUBLISHED_TOTAL.inc()
+        return connection, publisher
+    except pika.exceptions.AMQPError:
+        logger.exception("publish failed for eventId=%s, reconnecting and retrying", event.eventId)
+
+    connection, publisher = _reconnect(connection, settings)
+    try:
+        publisher.publish_event(event)
+        metrics.EVENTS_PUBLISHED_TOTAL.inc()
+    except Exception:
+        logger.exception("retry after reconnect failed for eventId=%s", event.eventId)
+    return connection, publisher
+
+
+def _service_idle_connection(
+    connection: pika.BlockingConnection, publisher: Publisher, settings: Settings
+) -> tuple[pika.BlockingConnection, Publisher]:
+    """Drive pika's I/O loop so heartbeats keep the connection alive while idle.
+
+    Reconnects if the connection has already been dropped (e.g. by RabbitMQ's
+    own heartbeat timeout) before this had a chance to service it.
+    """
+    try:
+        connection.process_data_events(time_limit=0)
+        return connection, publisher
+    except pika.exceptions.AMQPError:
+        logger.exception("watcher connection lost while idle, reconnecting")
+        return _reconnect(connection, settings)
+
+
+def run_watcher(settings: Settings, stop_event: threading.Event, readiness: ReadinessState) -> None:
     """Watch ``settings.watch_dir`` and publish an event per completed file.
 
-    Blocks until ``stop_event`` is set. Must be called from the same thread
-    that owns ``publisher`` / its underlying pika connection.
+    Owns its own RabbitMQ connection (created here, reconnected as needed,
+    closed on exit) and blocks until ``stop_event`` is set.
     """
+    connection, _channel, publisher = publisher_mod.connect_and_setup(settings)
+    readiness.set_ready("watcher", True)
+
     file_queue: queue.Queue[str] = queue.Queue()
     handler = DetectedFileHandler(file_queue)
 
@@ -121,6 +177,7 @@ def run_watcher(settings: Settings, publisher: Publisher, stop_event: threading.
             try:
                 path = file_queue.get(timeout=settings.stable_check_interval_s)
             except queue.Empty:
+                connection, publisher = _service_idle_connection(connection, publisher, settings)
                 continue
 
             if not os.path.isfile(path):
@@ -128,11 +185,15 @@ def run_watcher(settings: Settings, publisher: Publisher, stop_event: threading.
 
             try:
                 event = build_event(path, settings)
-                publisher.publish_event(event)
-                metrics.EVENTS_PUBLISHED_TOTAL.inc()
             except Exception:
-                logger.exception("failed to build/publish event for %s", path)
+                logger.exception("failed to build event for %s", path)
+                continue
+
+            connection, publisher = _publish_with_reconnect(connection, publisher, event, settings)
     finally:
+        readiness.set_ready("watcher", False)
         observer.stop()
         observer.join()
+        with contextlib.suppress(Exception):
+            connection.close()
         logger.info("watcher stopped")

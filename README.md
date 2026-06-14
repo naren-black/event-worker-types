@@ -32,7 +32,7 @@ Once `make up` finishes:
 | fake-gcs JSON API | http://localhost:4443/storage/v1/b |
 | SFTP | `sftp -P 2222 sftpuser@localhost` (password: `demopass`) |
 
-Drop any file into `/home/sftpuser/upload` on the SFTP server (or via
+Drop any file into `/config/upload` on the SFTP server (or via
 `make drop-file`) and watch `make logs` - the watcher publishes an event, the
 consumer uploads the file to both `wms-orders-processed` buckets, and
 `/metrics` reflects the result.

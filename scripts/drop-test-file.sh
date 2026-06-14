@@ -3,6 +3,8 @@
 # `docker compose cp`, which triggers the same inotify event a real upload
 # would) and wait for the worker to copy it to both MinIO (S3) and fake-gcs
 # (GCS). Used by `make drop-file` / `make smoke` and the CI e2e job.
+#
+# For dropping multiple randomized files at once, see drop-test-files.py.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -17,7 +19,9 @@ TIMEOUT="${TIMEOUT:-60}"
 
 ts=$(date +%Y%m%d%H%M%S)
 filename="ORD-${ts}.csv"
-key="orders/${filename}"
+# WATCH_DIR=/watch *is* the SFTP upload root (sftp-data volume), so the
+# worker's relative_key has no "orders/" prefix.
+key="${filename}"
 
 tmpfile=$(mktemp)
 trap 'rm -f "$tmpfile"' EXIT
@@ -27,9 +31,14 @@ order_id,sku,quantity,channel
 ORD-${ts}-1,SKU-1001,2,storefront
 ORD-${ts}-2,SKU-2002,1,ebay
 EOF
+chmod 644 "$tmpfile"
 
 echo "Dropping ${filename} onto the SFTP server..."
-"${COMPOSE[@]}" cp "$tmpfile" "sftp:/home/sftpuser/upload/${filename}"
+"${COMPOSE[@]}" cp "$tmpfile" "sftp:/config/upload/${filename}"
+# docker compose cp lands as root; match SFTP-owned files so the worker (uid
+# 10001, supplementary gid 1001) can read the shared volume.
+"${COMPOSE[@]}" exec -T sftp chown sftpuser:sftpuser "/config/upload/${filename}"
+"${COMPOSE[@]}" exec -T sftp chmod 664 "/config/upload/${filename}"
 
 echo "Waiting up to ${TIMEOUT}s for the worker to copy ${key} to S3 (MinIO) and GCS (fake-gcs)..."
 encoded_key=$(printf '%s' "$key" | sed 's#/#%2F#g')

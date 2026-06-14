@@ -35,6 +35,12 @@ It illustrates, alongside
   ARN, service account email, bucket names, function names, table name, DLQ
   URL, Firestore database name) needed to wire a real deployment to these
   resources.
+- **`aws_transfer.tf`** - an AWS Transfer Family SFTP server
+  (`SERVICE_MANAGED` identity, `domain = "S3"`) with one user whose home
+  directory maps straight to `orders/` in the bucket from `aws.tf` - a
+  managed-SFTP alternative to running the `atmoz/sftp` container + worker for
+  the AWS leg. See [ADR 0003](../../ADR.md) (Proposed) for the rationale,
+  what this would replace, and the open question for the GCS leg.
 
 In a real deployment, `S3_ENDPOINT_URL` / `GCS_ENDPOINT_URL` (see
 `.env.example`) would be unset - falling back to the real AWS/GCP endpoints -

@@ -8,7 +8,8 @@ from unittest.mock import MagicMock
 import pika
 import pytest
 
-from src.publisher import Publisher, declare_topology
+from src import publisher as publisher_module
+from src.publisher import Publisher, connect_and_setup, declare_topology
 from src.schema import TransferEvent
 
 
@@ -72,3 +73,19 @@ def test_publish_dlq_sets_reason_header(channel, settings, event):
     assert kwargs["routing_key"] == settings.dlq_name
     assert kwargs["properties"].headers == {"x-dlq-reason": "max_retries_exceeded"}
     assert json.loads(kwargs["body"])["eventId"] == event.eventId
+
+
+def test_connect_and_setup_declares_topology_and_wraps_publisher(monkeypatch, settings, channel):
+    mock_connection = MagicMock()
+    mock_connection.channel.return_value = channel
+    monkeypatch.setattr(publisher_module, "connect", MagicMock(return_value=mock_connection))
+
+    connection, returned_channel, publisher = connect_and_setup(settings)
+
+    assert connection is mock_connection
+    assert returned_channel is channel
+    assert isinstance(publisher, Publisher)
+    channel.confirm_delivery.assert_called_once()
+
+    declared = {call.kwargs["queue"] for call in channel.queue_declare.call_args_list}
+    assert declared == {settings.queue_name, settings.retry_queue_name, settings.dlq_name}

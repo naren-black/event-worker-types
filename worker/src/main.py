@@ -28,27 +28,16 @@ logger = logging.getLogger(__name__)
 
 
 def _run_watcher(settings: Settings, stop_event: threading.Event, readiness: ReadinessState) -> None:
-    connection = publisher_mod.connect(settings)
     try:
-        channel = connection.channel()
-        publisher_mod.declare_topology(channel, settings)
-        publisher = publisher_mod.Publisher(channel, settings)
-        readiness.set_ready("watcher", True)
-        run_watcher(settings, publisher, stop_event)
+        run_watcher(settings, stop_event, readiness)
     except Exception:
         logger.exception("watcher thread crashed")
         raise
-    finally:
-        readiness.set_ready("watcher", False)
-        connection.close()
 
 
 def _run_consumer(settings: Settings, stop_event: threading.Event, readiness: ReadinessState) -> None:
-    connection = publisher_mod.connect(settings)
+    connection, channel, publisher = publisher_mod.connect_and_setup(settings)
     try:
-        channel = connection.channel()
-        publisher_mod.declare_topology(channel, settings)
-        publisher = publisher_mod.Publisher(channel, settings)
         idempotency = IdempotencyStore(settings.idempotency_db_path)
         try:
             readiness.set_ready("consumer", True)

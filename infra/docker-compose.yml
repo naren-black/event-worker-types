@@ -1,7 +1,7 @@
 services:
 
   # ────────────────────────────────────────────────
-  # SFTP server (atmoz/sftp)
+  # SFTP server (linuxserver/openssh-server, see docker/sftp/Dockerfile)
   # Drop a CSV into the sftp-data volume to trigger
   # the worker via inotify on the shared volume.
   # Connect: sftp -P 2222 sftpuser@localhost
@@ -14,10 +14,17 @@ services:
     ports:
       - "2222:22"
     volumes:
-      - sftp-data:/home/sftpuser/upload
+      - sftp-data:/config/upload
     environment:
-      # Demo-only credentials for the local SFTP emulator (not a real secret).
-      SFTP_USERS: sftpuser:${SFTP_PASSWORD:-demopass}:1001:1001:upload
+      # linuxserver/openssh-server conventions: PUID/PGID (1001) match the gid
+      # the worker's group_add expects on the shared sftp-data volume.
+      # USER_NAME/USER_PASSWORD are demo-only credentials (not a real secret).
+      PUID: "1001"
+      PGID: "1001"
+      USER_NAME: sftpuser
+      USER_PASSWORD: ${SFTP_PASSWORD:-demopass}
+      PASSWORD_ACCESS: "true"
+      LISTEN_PORT: "22"
     healthcheck:
       test: ["CMD", "nc", "-z", "localhost", "22"]
       interval: 10s
@@ -76,6 +83,19 @@ services:
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      # --- MinIO STS / Workload-Identity-Federation PoC (scripts/test-minio-sts.py) ---
+      # Dex issues an id_token; AssumeRoleWithWebIdentity exchanges it for
+      # short-lived S3 credentials scoped to the wms-uploader-policy policy
+      # (created by minio-init).
+      MINIO_IDENTITY_OPENID_CONFIG_URL: "http://dex:5556/dex/.well-known/openid-configuration"
+      MINIO_IDENTITY_OPENID_CLIENT_ID: "minio-worker"
+      MINIO_IDENTITY_OPENID_CLIENT_SECRET: "minio-worker-secret"
+      MINIO_IDENTITY_OPENID_SCOPES: "openid"
+      MINIO_IDENTITY_OPENID_ROLE_POLICY: "wms-uploader-policy"
+      MINIO_IDENTITY_OPENID_DISPLAY_NAME: "dex"
+    depends_on:
+      dex:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "mc", "ready", "local"]
       interval: 10s
@@ -95,12 +115,15 @@ services:
     depends_on:
       minio:
         condition: service_healthy
+    volumes:
+      - ../docker/minio-init/wms-uploader-policy.json:/policies/wms-uploader-policy.json:ro
     entrypoint: >
       /bin/sh -c "
         mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin} &&
         mc mb --ignore-existing local/${S3_BUCKET:-wms-orders-processed} &&
         mc anonymous set none local/${S3_BUCKET:-wms-orders-processed} &&
-        echo 'MinIO bucket ready.'
+        mc admin policy create local wms-uploader-policy /policies/wms-uploader-policy.json &&
+        echo 'MinIO bucket and STS policy ready.'
       "
     networks:
       - internal
@@ -153,6 +176,29 @@ services:
         -H "Content-Type: application/json"
         -d "{\"name\": \"${GCS_BUCKET:-wms-orders-processed}\"}"
         || true; echo "fake-gcs bucket ready."
+    networks:
+      - internal
+
+  # ────────────────────────────────────────────────
+  # Dex — local OIDC provider for the MinIO STS /
+  # Workload-Identity-Federation proof of concept
+  # (scripts/test-minio-sts.py). Not used by the
+  # worker; demo-only.
+  # ────────────────────────────────────────────────
+  dex:
+    image: dexidp/dex:v2.41.1
+    container_name: dex
+    command: ["dex", "serve", "/dex/config.yaml"]
+    ports:
+      - "5556:5556"
+    volumes:
+      - ../docker/dex/config.yaml:/dex/config.yaml:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:5556/dex/.well-known/openid-configuration"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     networks:
       - internal
 
@@ -216,12 +262,15 @@ services:
       fake-gcs-init:
         condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/ready"]
       interval: 15s
       timeout: 5s
       retries: 5
-      start_period: 15s
+      start_period: 30s
     restart: on-failure
+    # Read files written by sftpuser (gid 1001) on the shared sftp-data volume.
+    group_add:
+      - "1001"
     networks:
       - internal
 

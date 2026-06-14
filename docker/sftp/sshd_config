@@ -1,6 +1,6 @@
-# Drop-in overrides for atmoz/sftp's sshd_config (loaded from
-# /etc/ssh/sshd_config.d/, which the base image's sshd_config already
-# includes).
+# Drop-in overrides for linuxserver/openssh-server's generated sshd_config
+# (loaded from /config/sshd/sshd_config.d/, which the entrypoint wires up via
+# an Include directive when that directory exists).
 
 # Verbose logging so file uploads are visible via `docker compose logs sftp`
 # - useful when demoing the watcher reacting to a new file.

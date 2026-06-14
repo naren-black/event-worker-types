@@ -59,3 +59,15 @@ variable "order_line_items_table_name" {
   type        = string
   default     = "order-line-items"
 }
+
+variable "transfer_user_name" {
+  description = "AWS Transfer Family SFTP username for the partner feed (ADR 0003)."
+  type        = string
+  default     = "partner-orders"
+}
+
+variable "transfer_user_ssh_public_key" {
+  description = "SSH public key (OpenSSH format) for the Transfer Family user (ADR 0003). Replace with the partner's real key - never commit a private key."
+  type        = string
+  default     = "ssh-ed25519 AAAA...REPLACE-ME partner-orders@example.com"
+}

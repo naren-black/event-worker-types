@@ -49,3 +49,13 @@ output "gcp_firestore_database_name" {
   description = "Firestore (Native mode) database holding parsed order CSV rows under orders/{orderId}/lineItems/{sku}."
   value       = google_firestore_database.default.name
 }
+
+output "aws_transfer_server_endpoint" {
+  description = "Hostname partners point their SFTP client at (ADR 0003)."
+  value       = "${aws_transfer_server.orders.id}.server.transfer.${var.aws_region}.amazonaws.com"
+}
+
+output "aws_transfer_user_name" {
+  description = "SFTP username for the partner feed, home directory mapped to orders/ in aws_bucket_name (ADR 0003)."
+  value       = aws_transfer_user.partner.user_name
+}

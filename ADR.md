@@ -192,3 +192,84 @@ serverless document/NoSQL store, keyed on `(orderId, sku)`:**
   `gcp_function.tf` follow ADR 0001's existing stub conventions (no
   `required_providers`/`provider`/backend blocks) - see
   `infra/terraform/README.md`.
+
+---
+
+# ADR 0003: Managed SFTP ingestion via AWS Transfer Family (S3-direct)
+
+**Status:** Proposed
+
+## Context
+
+ADR 0001's worker requires running and maintaining its own SFTP server
+(`atmoz/sftp`) plus a watcher/consumer that detects completed uploads and
+copies them into S3 via RabbitMQ. For the AWS leg specifically, that's four
+moving pieces - SFTP container, broker, worker process, and the worker's S3
+upload code - to get a file that's already arriving over SFTP into S3.
+
+[AWS Transfer Family](https://aws.amazon.com/aws-transfer-family/) offers a
+fully managed SFTP/FTPS/FTP endpoint whose storage backend *is* an S3 bucket
+(`domain = "S3"`). A file uploaded via SFTP to a Transfer Family server
+appears in S3 the moment the `PUT` completes - no watcher, no broker, no
+upload step. This ADR is **Proposed**, not Accepted: it's an alternative
+worth trying for the AWS leg, to be evaluated against ADR 0001's broker-first
+design rather than assumed to replace it outright.
+
+## Decision
+
+Stand up `aws_transfer_server` (protocol `SFTP`, `identity_provider_type =
+"SERVICE_MANAGED"`, `domain = "S3"`), with one `aws_transfer_user` whose
+`home_directory_type = "LOGICAL"` maps the user's SFTP root directly onto
+`orders/` inside the *existing* `aws_s3_bucket.orders_processed` bucket from
+`aws.tf`. Authentication is via `aws_transfer_ssh_key` (public key only - AWS
+never holds a private key).
+
+Because files land under the same `orders/*.csv` prefix that
+`aws_s3_bucket_notification.orders_processed` (ADR 0002) already watches,
+**`order-csv-to-dynamodb` requires zero changes** - it fires exactly as it
+does today, just triggered by an SFTP upload landing directly in S3 instead
+of by a worker upload.
+
+## Alternatives considered & rejected
+
+- **AWS Transfer Family *Connector* (`aws_transfer_connector`), not Server.**
+  A Connector is the wrong shape here: it's an AWS-side resource that
+  *initiates* transfers to/from a *remote, third-party* SFTP server (via
+  `StartFileTransfer`, typically on a schedule) - useful if a partner runs
+  their own SFTP server and AWS needs to pull from it. Here, AWS itself needs
+  to *be* the SFTP endpoint partners upload to - that's a Server.
+- **`identity_provider_type = "API_GATEWAY"` or `"AWS_DIRECTORY_SERVICE"`**
+  for custom/AD-backed auth. Both add real infrastructure (an API Gateway +
+  Lambda authorizer, or a Directory Service directory) for credential
+  management this demo doesn't need - `SERVICE_MANAGED` gives AWS-hosted SSH
+  key storage per user with one extra resource
+  (`aws_transfer_ssh_key`).
+- **Self-hosted SFTP-to-S3 sync** (`atmoz/sftp` + a cron job running `aws s3
+  sync`/`rclone`). Keeps an always-on container and adds polling latency;
+  Transfer Family is pay-per-use (per-hour endpoint + per-GB transferred)
+  with no idle container and no polling delay.
+
+## Consequences / trade-offs
+
+- **No local emulator.** Unlike everything else in `infra/terraform/`,
+  Transfer Family has no MinIO-style local stand-in - it can only be
+  illustrated here, not exercised via `docker compose`. Trying it for real
+  needs an actual AWS account.
+- **The GCS leg loses its trigger.** ADR 0001's worker watched one directory
+  and uploaded to *both* clouds. If SFTP moves to Transfer Family (S3-only),
+  nothing uploads to GCS. The natural fix is a small **S3-triggered Lambda
+  that replicates `orders/*.csv` to the GCS `orders_processed` bucket** - the
+  same `aws_s3_bucket_notification` mechanism as `order-csv-to-dynamodb`, a
+  new function alongside it. Not built in this pass.
+- **RabbitMQ/the worker become optional for the AWS leg**, but ADR 0001's
+  retry/DLQ/idempotency guarantees don't disappear with them - they'd need to
+  be re-implemented (more simply) inside the replication Lambda above for the
+  GCS leg to keep the same guarantees. This is the main open question if this
+  direction is pursued further.
+- **Per-user IAM scoping.** Each `aws_transfer_user` needs its own
+  `aws_iam_role`/`aws_transfer_ssh_key` - onboarding a second partner feed
+  (e.g. a separate eBay drop) means one more user/role/key, not a config
+  change to a shared worker.
+- **Still illustrative, not deployable as-is** - `aws_transfer.tf` follows the
+  same stub conventions as `aws.tf`/`aws_lambda.tf` (no
+  `required_providers`/`provider`/backend blocks).

@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Wait for every service in the local stack to report healthy (or, for
-# one-shot init containers, to have exited successfully). Used by `make smoke`
-# and the CI e2e job.
+# one-shot init containers, to have exited successfully), then drop test
+# file(s) through the pipeline via drop-test-files.py to verify it end to
+# end. Used by `make smoke` and the CI e2e job.
+#
+# Set FILE_COUNT to drop more than one randomized file (see drop-test-files.py).
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -52,7 +55,7 @@ while true; do
 
   if $all_ok; then
     echo "stack healthy: ${status_line}"
-    exit 0
+    exec "$ROOT_DIR/scripts/drop-test-files.py"
   fi
 
   if [ "$elapsed" -ge "$TIMEOUT" ]; then

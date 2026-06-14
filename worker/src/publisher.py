@@ -121,3 +121,14 @@ class Publisher:
             properties=properties,
             mandatory=True,
         )
+
+
+def connect_and_setup(settings: Settings) -> tuple[pika.BlockingConnection, BlockingChannel, Publisher]:
+    """Open a connection, declare topology, and wrap it in a ``Publisher``.
+
+    Used for both initial setup and reconnection after a dropped connection.
+    """
+    connection = connect(settings)
+    channel = connection.channel()
+    declare_topology(channel, settings)
+    return connection, channel, Publisher(channel, settings)

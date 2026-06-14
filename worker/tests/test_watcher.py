@@ -9,11 +9,22 @@ from __future__ import annotations
 import hashlib
 import queue
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
+import pika
+import pytest
 from watchdog.events import FileClosedEvent, FileMovedEvent
 
+from src import watcher as watcher_mod
+from src.schema import TransferEvent
 from src.utils import compute_idempotency_key
-from src.watcher import DetectedFileHandler, build_event, guess_content_type
+from src.watcher import (
+    DetectedFileHandler,
+    _publish_with_reconnect,
+    _service_idle_connection,
+    build_event,
+    guess_content_type,
+)
 
 
 def test_build_event_for_csv(settings, write_file):
@@ -93,3 +104,94 @@ def test_detected_file_handler_ignores_directory_events():
     handler.on_moved(SimpleNamespace(is_directory=True, dest_path="/watch/orders"))
 
     assert file_queue.empty()
+
+
+@pytest.fixture
+def connection() -> MagicMock:
+    return MagicMock()
+
+
+@pytest.fixture
+def publisher() -> MagicMock:
+    return MagicMock()
+
+
+@pytest.fixture
+def event(example_event_dict) -> TransferEvent:
+    return TransferEvent.model_validate(example_event_dict)
+
+
+def test_publish_with_reconnect_happy_path(connection, publisher, event, settings):
+    result_connection, result_publisher = _publish_with_reconnect(connection, publisher, event, settings)
+
+    publisher.publish_event.assert_called_once_with(event)
+    assert result_connection is connection
+    assert result_publisher is publisher
+
+
+def test_publish_with_reconnect_reconnects_and_retries_on_amqp_error(
+    monkeypatch, connection, publisher, event, settings
+):
+    publisher.publish_event.side_effect = pika.exceptions.StreamLostError("boom")
+
+    new_connection = MagicMock()
+    new_publisher = MagicMock()
+    monkeypatch.setattr(
+        watcher_mod.publisher_mod,
+        "connect_and_setup",
+        MagicMock(return_value=(new_connection, MagicMock(), new_publisher)),
+    )
+
+    result_connection, result_publisher = _publish_with_reconnect(connection, publisher, event, settings)
+
+    connection.close.assert_called_once()
+    publisher.publish_event.assert_called_once_with(event)
+    new_publisher.publish_event.assert_called_once_with(event)
+    assert result_connection is new_connection
+    assert result_publisher is new_publisher
+
+
+def test_publish_with_reconnect_retry_failure_does_not_raise(
+    monkeypatch, connection, publisher, event, settings
+):
+    publisher.publish_event.side_effect = pika.exceptions.StreamLostError("boom")
+
+    new_connection = MagicMock()
+    new_publisher = MagicMock()
+    new_publisher.publish_event.side_effect = RuntimeError("still broken")
+    monkeypatch.setattr(
+        watcher_mod.publisher_mod,
+        "connect_and_setup",
+        MagicMock(return_value=(new_connection, MagicMock(), new_publisher)),
+    )
+
+    result_connection, result_publisher = _publish_with_reconnect(connection, publisher, event, settings)
+
+    assert result_connection is new_connection
+    assert result_publisher is new_publisher
+
+
+def test_service_idle_connection_drives_io_loop(connection, publisher, settings):
+    result_connection, result_publisher = _service_idle_connection(connection, publisher, settings)
+
+    connection.process_data_events.assert_called_once_with(time_limit=0)
+    assert result_connection is connection
+    assert result_publisher is publisher
+
+
+def test_service_idle_connection_reconnects_on_amqp_error(monkeypatch, connection, publisher, settings):
+    connection.process_data_events.side_effect = pika.exceptions.StreamLostError("boom")
+
+    new_connection = MagicMock()
+    new_publisher = MagicMock()
+    monkeypatch.setattr(
+        watcher_mod.publisher_mod,
+        "connect_and_setup",
+        MagicMock(return_value=(new_connection, MagicMock(), new_publisher)),
+    )
+
+    result_connection, result_publisher = _service_idle_connection(connection, publisher, settings)
+
+    connection.close.assert_called_once()
+    assert result_connection is new_connection
+    assert result_publisher is new_publisher
