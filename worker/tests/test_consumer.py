@@ -117,6 +117,36 @@ def test_unsupported_schema_version_routed_to_dlq(consumer, channel, settings, e
     assert json.loads(kwargs["body"])["eventId"] == event.eventId
 
 
+@pytest.fixture
+def event_with_malicious_file(example_event_dict, write_file):
+    """example_event_dict, but pointing at a file that fails the CSV security scan
+    (a cell starting with "=", the classic formula-injection prefix)."""
+    content = b"order_id,sku,quantity,channel\nORD-1,=cmd|' /c calc'!A0,3,storefront\n"
+    path = write_file("orders/ORD-evil.csv", content)
+    example_event_dict["source"]["path"] = str(path)
+    example_event_dict["file"]["sizeBytes"] = len(content)
+    example_event_dict["file"]["checksumSha256"] = hashlib.sha256(content).hexdigest()
+    return example_event_dict
+
+
+def test_csv_security_check_failure_routed_to_dlq(
+    monkeypatch, consumer, channel, settings, event_with_malicious_file
+):
+    event = TransferEvent.model_validate(event_with_malicious_file)
+
+    async def must_not_be_called(*_args, **_kwargs):
+        raise AssertionError("upload_all should not be called for a file failing the security scan")
+
+    monkeypatch.setattr(consumer_module, "upload_all", must_not_be_called)
+
+    consumer._handle(_method(8), _properties(), event.to_json_bytes())
+
+    channel.basic_ack.assert_called_once_with(8)
+    _, kwargs = channel.basic_publish.call_args
+    assert kwargs["routing_key"] == settings.dlq_name
+    assert kwargs["properties"].headers == {"x-dlq-reason": "csv_security_check_failed"}
+
+
 def test_missing_source_file_routed_to_dlq(consumer, channel, settings, example_event_dict, tmp_path):
     example_event_dict["source"]["path"] = str(tmp_path / "missing.csv")
     event = TransferEvent.model_validate(example_event_dict)

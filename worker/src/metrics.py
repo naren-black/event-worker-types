@@ -50,6 +50,13 @@ IDEMPOTENCY_HITS_TOTAL = Counter(
     registry=REGISTRY,
 )
 
+CSV_SECURITY_REJECTIONS_TOTAL = Counter(
+    "csv_security_rejections_total",
+    "Files rejected by the basic CSV security scan, by issue type",
+    ["issue_type"],
+    registry=REGISTRY,
+)
+
 
 def render() -> tuple[bytes, str]:
     """Return (body, content_type) for the /metrics endpoint."""

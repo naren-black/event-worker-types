@@ -18,6 +18,7 @@ from pika.adapters.blocking_connection import BlockingChannel
 
 from . import metrics
 from .config import Settings
+from .csv_security import scan_csv_file
 from .idempotency import IdempotencyStore
 from .publisher import Publisher
 from .schema import TransferEvent, UnsupportedSchemaVersionError
@@ -99,6 +100,17 @@ class Consumer:
         if not os.path.isfile(event.source.path):
             logger.error("source file missing, routing to DLQ", extra=log_extra)
             self._publisher.publish_dlq(event, reason="source_file_missing")
+            self._channel.basic_ack(method.delivery_tag)
+            metrics.EVENTS_CONSUMED_TOTAL.labels(result="dlq").inc()
+            metrics.DLQ_MESSAGES_TOTAL.inc()
+            return
+
+        issues = scan_csv_file(event.source.path, self._settings)
+        if issues:
+            logger.error("csv security check failed: %s, routing to DLQ", ", ".join(issues), extra=log_extra)
+            for issue in issues:
+                metrics.CSV_SECURITY_REJECTIONS_TOTAL.labels(issue_type=issue.split(":", 1)[0]).inc()
+            self._publisher.publish_dlq(event, reason="csv_security_check_failed")
             self._channel.basic_ack(method.delivery_tag)
             metrics.EVENTS_CONSUMED_TOTAL.labels(result="dlq").inc()
             metrics.DLQ_MESSAGES_TOTAL.inc()

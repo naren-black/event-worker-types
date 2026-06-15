@@ -77,6 +77,11 @@ header) tells you why:
   producer/consumer version mismatch.
 - `source_file_missing` - the file the event points to no longer exists on
   `/watch` (e.g. removed before the consumer ran).
+- `csv_security_check_failed` - `src/csv_security.py`'s pre-upload scan found
+  an issue: oversized file (`MAX_CSV_FILE_SIZE_BYTES`), binary/non-UTF-8
+  content, or a cell starting with `=`, `+`, `-`, `@`, tab, or CR (CSV/formula
+  injection). The `csv_security_rejections_total{issue_type=...}` metric and
+  the worker logs around that `correlationId` show which check(s) failed.
 - `max_retries_exceeded` - all `RETRY_MAX_ATTEMPTS` attempts failed; check
   `retry.lastError` for the underlying upload error
   (`<provider>:upload_timeout`, `<provider>:<ExceptionClassName>`, etc.) and

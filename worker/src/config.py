@@ -58,6 +58,9 @@ class Settings:
     retry_backoff_base: float = 2.0
     upload_timeout_s: float = 30.0
 
+    # Basic CSV security scan (src/csv_security.py), run before upload
+    max_csv_file_size_bytes: int = 10_000_000
+
     # Idempotency store
     idempotency_db_path: str = "/data/idempotency.db"
 
@@ -92,6 +95,7 @@ class Settings:
             retry_max_attempts=_int("RETRY_MAX_ATTEMPTS", cls.retry_max_attempts),
             retry_backoff_base=_float("RETRY_BACKOFF_BASE", cls.retry_backoff_base),
             upload_timeout_s=_float("UPLOAD_TIMEOUT_S", cls.upload_timeout_s),
+            max_csv_file_size_bytes=_int("MAX_CSV_FILE_SIZE_BYTES", cls.max_csv_file_size_bytes),
             idempotency_db_path=_str("IDEMPOTENCY_DB_PATH", cls.idempotency_db_path),
             log_level=_str("LOG_LEVEL", cls.log_level),
             service_name=_str("SERVICE_NAME", cls.service_name),

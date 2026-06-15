@@ -59,8 +59,9 @@ Machine-readable schema: [`schemas/transfer-event.schema.json`](../schemas/trans
   routed to the **DLQ** (`orders.inbound.dlq`) instead of retried, with `x-death`
   headers plus `retry.lastError` populated.
 - **Permanent** failures (schema validation failure, unsupported `schemaVersion`
-  major, unknown destination `provider`) skip retries entirely and go straight to the
-  DLQ — retrying a malformed message can't fix it.
+  major, unknown destination `provider`, failing the basic CSV security scan in
+  `src/csv_security.py`) skip retries entirely and go straight to the DLQ —
+  retrying a malformed/unsafe message can't fix it.
 - Idempotency: before uploading, the consumer checks `idempotencyKey` against a local
   store (SQLite). If already marked `done`, the message is ack'd as a no-op. This makes
   redeliveries (broker crash, requeue after worker restart) safe.
